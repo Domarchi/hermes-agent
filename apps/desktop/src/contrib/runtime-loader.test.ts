@@ -5,7 +5,20 @@ import type * as HermesModule from '@/hermes'
 
 import { emitGatewayEvent } from './events'
 import { $pluginRecords, publishPlugin, setPluginEnabled } from './plugins-store'
-import { discoverRuntimePlugins, loadRuntimePlugin, unloadRuntimePlugin, watchRuntimePlugins } from './runtime-loader'
+import {
+  discoverRuntimePlugins,
+  loadRuntimePlugin,
+  pluginTrust,
+  unloadRuntimePlugin,
+  watchRuntimePlugins
+} from './runtime-loader'
+
+const loadSandboxedPlugin = vi.fn(async (_source: string, origin: string, _options?: unknown) => origin)
+
+vi.mock('./sandbox/loader', () => ({
+  loadSandboxedPlugin: (...args: [string, string, unknown]) => loadSandboxedPlugin(...args),
+  unloadSandboxedPlugin: () => undefined
+}))
 
 // getStatus would supply the connected backend's hermes_home — a REMOTE path in
 // remote mode. The disk scanner must NOT derive the plugin root from it (#66899).
@@ -203,6 +216,40 @@ describe('scanDiskPlugins (#66899)', () => {
       revokeObjectURL.mockRestore()
       vi.stubGlobal('Blob', RealBlob)
       delete (globalThis as unknown as { __uniRegister?: unknown }).__uniRegister
+    }
+  })
+})
+
+describe('trust tiers', () => {
+  it('classifies catalog provenance as `catalog`, everything else on disk as `local`', () => {
+    expect(pluginTrust({ packageOrigin: { catalogName: 'weather', repo: 'r' } })).toBe('catalog')
+    expect(pluginTrust({ packageOrigin: { repo: 'https://example.invalid/custom.git' } })).toBe('local')
+    expect(pluginTrust({})).toBe('local')
+  })
+
+  it('never evaluates a catalog-tier source in the renderer realm — it goes to the sandbox loader', async () => {
+    loadSandboxedPlugin.mockClear()
+
+    const register = vi.fn()
+
+    ;(globalThis as unknown as { __catRegister: unknown }).__catRegister = register
+
+    try {
+      const id = await loadRuntimePlugin('export default { id: "cat", register: globalThis.__catRegister }', 'cat', {
+        capabilities: ['ui'],
+        packageName: 'cat',
+        packageOrigin: { catalogName: 'cat', repo: 'r', sha: 'abc' }
+      })
+
+      expect(id).toBe('cat')
+      expect(register).not.toHaveBeenCalled()
+      expect(loadSandboxedPlugin).toHaveBeenCalledWith(
+        expect.stringContaining('__catRegister'),
+        'cat',
+        expect.objectContaining({ capabilities: ['ui'], packageName: 'cat' })
+      )
+    } finally {
+      delete (globalThis as unknown as { __catRegister?: unknown }).__catRegister
     }
   })
 })

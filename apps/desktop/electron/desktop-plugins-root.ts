@@ -18,6 +18,8 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
+import { readDesktopCapabilities } from './desktop-plugin-manifest'
+
 export const DESKTOP_PLUGINS_DIR = 'desktop-plugins'
 /** Marker inside a materialized desktop half: which agent package it came from. */
 export const PACKAGE_MARKER = '.hermes-package.json'
@@ -34,6 +36,9 @@ export interface DesktopHalfMarker {
   repo?: string
   sha?: string
   catalogName?: string
+  /** `desktop_capabilities` declared in the package's plugin.yaml — the
+   *  renderer's sandbox grant list for catalog-tier halves. */
+  desktopCapabilities?: string[]
 }
 
 /** Provenance of an installed agent package: catalog sidecar first, then the
@@ -198,7 +203,8 @@ export async function materializeDesktopHalf(
     package: packageName,
     source: sourceDir,
     sourceMtimeMs: stat.mtimeMs,
-    ...(await packageOrigin(packageDir))
+    ...(await packageOrigin(packageDir)),
+    desktopCapabilities: await readDesktopCapabilities(packageDir)
   }
 
   await publishDesktopTree(sourceDir, target, staged =>

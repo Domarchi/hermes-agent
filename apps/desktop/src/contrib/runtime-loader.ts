@@ -15,17 +15,29 @@
  * and the unified agent-plugin half `<hermes home>/plugins/<name>/desktop/
  * plugin.js` — the doors the agent writes through.
  *
- * SECURITY — this is NOT a capability boundary. A loaded plugin is evaluated
- * as ESM in the renderer realm with FULL app authority: the React singleton,
- * the whole SDK (`host.request` gateway RPC, `ctx.rest`, storage, `navigate`).
- * The isolation here is *error* isolation only (ContribBoundary, isolated
- * listeners) — a plugin can't crash the app, but it can do anything the app
- * can. That's acceptable for local sources (disk files can already run code),
- * and `integrity` only proves the bytes match a hash — it does NOT sandbox.
- * A remote source (https + allowlist) must NOT reuse this pipeline as-is:
- * it needs a real boundary (iframe/worker + CSP + capability gating) before
- * it can land. The `{ integrity }` option is the transport seam, not the
- * trust seam.
+ * SECURITY — TRUST TIERS. Every plugin source is classified (`pluginTrust`)
+ * before it is evaluated, and the tier picks the pipeline:
+ *
+ *  - `bundled` (in-repo `src/plugins/*`) and `local` (files the user or the
+ *    agent wrote under `<hermes home>/desktop-plugins/<name>/` or a
+ *    `plugins/<name>/desktop/` half with NO catalog provenance) take THIS
+ *    pipeline: ESM in the renderer realm with FULL app authority — the React
+ *    singleton, the whole SDK (`host.request`, `ctx.rest`, storage,
+ *    `navigate`). Isolation here is *error* isolation only (ContribBoundary,
+ *    isolated listeners): a plugin can't crash the app, but it can do
+ *    anything the app can. Acceptable because a disk file the user placed
+ *    can already run code; `integrity` proves bytes, it does NOT sandbox.
+ *  - `catalog` (the desktop half of a package installed from the plugin
+ *    catalog — the `.hermes-package.json` marker carries `catalogName`) is a
+ *    REMOTE source and never enters this realm. It goes to
+ *    `sandbox/loader.ts`: a per-plugin `<iframe sandbox="allow-scripts">`
+ *    (opaque origin, `default-src 'none'` CSP, its own React copy) behind a
+ *    postMessage bridge that answers only the capability-gated SDK subset in
+ *    `sandbox/methods.ts`; grants come from the manifest's
+ *    `desktop_capabilities` (default: ui, storage, events, rest).
+ *
+ * Widening a tier (e.g. treating a git-URL install as `catalog`) is a policy
+ * change made in `pluginTrust`, in one place.
  */
 
 import { atom } from 'nanostores'
@@ -36,8 +48,21 @@ import { notifyError } from '@/store/notifications'
 import { trackGatewayEventDisposers } from './events'
 import { createPluginContext, type HermesPlugin } from './plugin'
 import { $pluginRecords, dropPlugin, pluginActive, type PluginKind, publishPlugin } from './plugins-store'
+import { loadSandboxedPlugin, unloadSandboxedPlugin } from './sandbox/loader'
+
+/** Where a plugin source came from — the input to the pipeline choice above. */
+export type PluginTrust = 'bundled' | 'catalog' | 'local'
+
+/** Classify a disk source. Catalog provenance is the marker's `catalogName`,
+ *  written by Electron from the install sidecar (`.hermes-catalog.json`). */
+export function pluginTrust(options: Pick<LoadOptions, 'packageOrigin'>): PluginTrust {
+  return options.packageOrigin?.catalogName ? 'catalog' : 'local'
+}
 
 interface LoadOptions {
+  /** Declared `desktop_capabilities` (plugin.yaml) — consulted for the
+   *  `catalog` tier only; the renderer-realm tiers have full authority. */
+  capabilities?: readonly unknown[]
   /** Root-level default-enable CAP: `false` ships the plugin opt-in (inventory
    *  row, off until the user toggles) even if the plugin says otherwise. The
    *  unified agent-plugin root sets this so `~/.hermes/plugins` keeps its
@@ -108,14 +133,21 @@ async function verifyIntegrity(source: string, integrity: string): Promise<boole
 export function unloadRuntimePlugin(id: string): void {
   loaded.get(id)?.forEach(dispose => dispose())
   loaded.delete(id)
+  unloadSandboxedPlugin(id)
 }
 
-/** Evaluate + register one runtime plugin. Returns its id, or null on failure. */
+/** Evaluate + register one runtime plugin. Returns its id, or null on failure.
+ *  Catalog-tier sources are handed to the sandbox loader and never reach the
+ *  blob import below. */
 export async function loadRuntimePlugin(
   source: string,
   origin: string,
   options: LoadOptions = {}
 ): Promise<null | string> {
+  if (pluginTrust(options) === 'catalog') {
+    return loadSandboxedPlugin(source, origin, options)
+  }
+
   installPluginSdk()
 
   try {
@@ -265,6 +297,8 @@ async function diskRoots(): Promise<DiskRoot[]> {
 const PACKAGE_MARKER = '.hermes-package.json'
 
 interface PackageMarker {
+  /** `desktop_capabilities` from the package's plugin.yaml, when declared. */
+  capabilities?: string[]
   origin?: { catalogName?: string; repo?: string; sha?: string }
   package: string
 }
@@ -280,6 +314,7 @@ async function readPackageMarker(desktop: Window['hermesDesktop'], folder: strin
 
     const parsed = JSON.parse((await desktop.readFileText(marker.path)).text) as {
       catalogName?: string
+      desktopCapabilities?: unknown
       package?: string
       repo?: string
       sha?: string
@@ -290,6 +325,7 @@ async function readPackageMarker(desktop: Window['hermesDesktop'], folder: strin
     }
 
     return {
+      capabilities: Array.isArray(parsed.desktopCapabilities) ? parsed.desktopCapabilities.map(String) : undefined,
       origin: parsed.repo ? { catalogName: parsed.catalogName, repo: parsed.repo, sha: parsed.sha } : undefined,
       package: parsed.package
     }
@@ -299,6 +335,7 @@ async function readPackageMarker(desktop: Window['hermesDesktop'], folder: strin
 }
 
 interface DiskPlugin {
+  capabilities?: string[]
   /** Root posture, forwarded on every (re)load of this entry. */
   defaultEnabled?: boolean
   file: string
@@ -367,6 +404,7 @@ async function loadDiskPlugin(entry: DiskPlugin): Promise<boolean> {
     const text = await readPluginSourceText(entry.file)
 
     const id = await loadRuntimePlugin(text, entry.origin, {
+      capabilities: entry.capabilities,
       defaultEnabled: entry.defaultEnabled,
       file: entry.file,
       packageName: entry.packageName,
@@ -497,6 +535,7 @@ async function scanDiskPlugins(): Promise<void> {
         const marker = await readPackageMarker(desktop, dir.path)
 
         const record: DiskPlugin = {
+          capabilities: marker?.capabilities,
           // A unified package's desktop half ships opt-in, like its agent half.
           defaultEnabled: marker ? false : undefined,
           file,
