@@ -44,7 +44,7 @@ def _sync_shared_roster_many(records: List[Dict[str, Any]]) -> None:
 
 
 def _sync_shared_roster(record: Dict[str, Any]) -> None:
-    """Publish one registration or tool-progress update through the batch writer."""
+    """Publish one registration through the batch writer."""
     _sync_shared_roster_many([record])
 
 
@@ -52,7 +52,7 @@ def _heartbeat_publish_once() -> bool:
     """Publish the current live set while holding the unregister linearization lock."""
     with _roster_io_lock:
         with _active_subagents_lock:
-            records = list(_active_subagents.values())
+            records = [dict(record) for record in _active_subagents.values()]
         if not records:
             return False
         _sync_shared_roster_many(records)
@@ -82,7 +82,9 @@ def _ensure_roster_heartbeat() -> None:
     with _roster_heartbeat_lock:
         if _roster_heartbeat_thread is not None and _roster_heartbeat_thread.is_alive():
             return
-        _roster_heartbeat_thread = threading.Thread(
+        from agent.memory_provider import spawn_context_thread
+
+        _roster_heartbeat_thread = spawn_context_thread(
             target=_run_roster_heartbeat, name="delegation-roster-heartbeat", daemon=True,
         )
         _roster_heartbeat_thread.start()
@@ -247,15 +249,13 @@ def _capture_gateway_steer_authority(owner_session_id: Optional[str]) -> tuple[A
         return None, None
 
 def _update_subagent_progress(subagent_id: str, tool_count: int, last_tool: str) -> None:
-    """Update and publish tool progress without allowing a stale record to resurrect after unregister."""
-    with _roster_io_lock:
-        with _active_subagents_lock:
-            record = _active_subagents.get(subagent_id)
-            if record is None:
-                return
-            record["tool_count"] = tool_count
-            record["last_tool"] = last_tool
-        _sync_shared_roster(record)
+    """Update in-memory progress; the batched heartbeat publishes it within one second."""
+    with _active_subagents_lock:
+        record = _active_subagents.get(subagent_id)
+        if record is None:
+            return
+        record["tool_count"] = tool_count
+        record["last_tool"] = last_tool
 
 
 # Registry record fields never exposed to the TUI/RPC snapshot.

@@ -238,6 +238,92 @@ def test_observable_local_records_are_fail_closed_to_the_requested_profile(
     ] == ["b"]
 
 
+def test_tool_progress_is_memory_only_until_the_next_heartbeat(monkeypatch):
+    """A tool start must not open SQLite; the one-second batch heartbeat publishes it."""
+    from tools import delegate_tool_registry as registry
+
+    record = {"subagent_id": "sa-progress", "tool_count": 0, "last_tool": ""}
+    writes = []
+    monkeypatch.setattr(registry, "_active_subagents", {"sa-progress": record})
+    monkeypatch.setattr(
+        registry,
+        "_sync_shared_roster",
+        lambda published: writes.append(dict(published)),
+    )
+
+    registry._update_subagent_progress("sa-progress", 7, "web_search")
+
+    assert record["tool_count"] == 7
+    assert record["last_tool"] == "web_search"
+    assert writes == []
+
+
+def test_heartbeat_copies_progress_before_releasing_the_registry_lock(monkeypatch):
+    """A heartbeat writes one coherent progress snapshot, never a live dict being mutated."""
+    from tools import delegate_tool_registry as registry
+
+    record = {"subagent_id": "sa-progress", "tool_count": 7, "last_tool": "web_search"}
+    published = []
+    monkeypatch.setattr(registry, "_active_subagents", {"sa-progress": record})
+    monkeypatch.setattr(
+        registry,
+        "_sync_shared_roster_many",
+        lambda records: published.extend(records),
+    )
+
+    assert registry._heartbeat_publish_once() is True
+    assert published == [record]
+    assert published[0] is not record
+
+
+def test_roster_heartbeat_uses_the_context_preserving_thread_factory(monkeypatch):
+    """The long-lived worker inherits profile, secret and terminal-policy contextvars."""
+    from agent import memory_provider
+    from tools import delegate_tool_registry as registry
+
+    created = []
+
+    class StubThread:
+        def __init__(self):
+            self.started = False
+
+        def is_alive(self):
+            return self.started
+
+        def start(self):
+            self.started = True
+
+    def spawn(target, *, name, daemon=True, args=(), kwargs=None):
+        thread = StubThread()
+        created.append({
+            "target": target,
+            "name": name,
+            "daemon": daemon,
+            "args": args,
+            "kwargs": kwargs,
+            "thread": thread,
+        })
+        return thread
+
+    def reject_bare_thread(*args, **kwargs):
+        pytest.fail("heartbeat used bare threading.Thread")
+
+    class RejectThreading:
+        Thread = staticmethod(reject_bare_thread)
+
+    monkeypatch.setattr(memory_provider, "spawn_context_thread", spawn)
+    monkeypatch.setattr(registry, "threading", RejectThreading)
+    monkeypatch.setattr(registry, "_roster_heartbeat_thread", None)
+
+    registry._ensure_roster_heartbeat()
+
+    assert len(created) == 1
+    assert created[0]["target"] is registry._run_roster_heartbeat
+    assert created[0]["name"] == "delegation-roster-heartbeat"
+    assert created[0]["daemon"] is True
+    assert created[0]["thread"].started is True
+
+
 def test_heartbeat_snapshot_uses_the_record_owner_profile_for_redaction(
     tmp_path, monkeypatch
 ):
